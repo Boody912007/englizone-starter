@@ -1,0 +1,232 @@
+// EngliZone — Prisma schema
+// Implements the core tables from the brief: Users, Courses, Modules,
+// Lessons, Quizzes & Questions, Enrollments — plus supporting models for
+// sessions (concurrent-login prevention) and payments (Fawry/Paymob/Instapay
+// webhook flow), since both are referenced as hard requirements.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  STUDENT
+  TEACHER
+  ADMIN
+}
+
+enum QuestionType {
+  MCQ
+  AUDIO
+  TEXT
+}
+
+enum EnrollmentStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentProvider {
+  FAWRY
+  PAYMOB
+  INSTAPAY
+}
+
+enum PaymentStatus {
+  INITIATED
+  PAID
+  FAILED
+  EXPIRED
+}
+
+// ---------- Core tables ----------
+
+model User {
+  id           String   @id @default(cuid())
+  role         Role     @default(STUDENT)
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String
+  points       Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  enrollments   Enrollment[]
+  sessions      Session[]
+  quizAttempts  QuizAttempt[]
+  courseCodes   SubscriptionCode[] @relation("RedeemedBy")
+
+  @@index([role])
+}
+
+// One row per active login — enables "logging in from a new device
+// automatically logs out the old session" via refreshTokenHash rotation
+// and a revokedAt check on every request.
+model Session {
+  id                String    @id @default(cuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash  String
+  userAgent         String?
+  ipAddress         String?
+  createdAt         DateTime  @default(now())
+  revokedAt         DateTime?
+
+  @@index([userId])
+}
+
+model Course {
+  id             String    @id @default(cuid())
+  title          String
+  description    String
+  price          Decimal   @db.Decimal(10, 2)
+  discountPrice  Decimal?  @db.Decimal(10, 2)
+  targetGrade    String
+  startDate      DateTime?
+  endDate        DateTime?
+  thumbnailUrl   String?
+  isPublished    Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  modules      Module[]
+  enrollments  Enrollment[]
+  banners      AlertBanner[]
+
+  @@index([isPublished])
+}
+
+// "Modules/Sections" in the brief — kept fully dynamic (orderIndex only, no
+// hardcoded unit count) so units/lessons can be added later from the admin
+// panel before any video exists.
+model Module {
+  id         String   @id @default(cuid())
+  courseId   String
+  course     Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title      String
+  orderIndex Int
+  createdAt  DateTime @default(now())
+
+  lessons Lesson[]
+
+  @@index([courseId, orderIndex])
+}
+
+model Lesson {
+  id           String   @id @default(cuid())
+  moduleId     String
+  module       Module   @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  title        String
+  videoUrl     String?  // Bunny Stream signed/DRM URL — see README for token flow
+  documentUrl  String?
+  isFree       Boolean  @default(false)
+  orderIndex   Int
+  createdAt    DateTime @default(now())
+
+  quizzes Quiz[]
+
+  @@index([moduleId, orderIndex])
+}
+
+model Quiz {
+  id        String     @id @default(cuid())
+  lessonId  String
+  lesson    Lesson     @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  title     String
+  timeLimitSeconds Int?   // powers <QuizTimer />
+  createdAt DateTime   @default(now())
+
+  questions Question[]
+  attempts  QuizAttempt[]
+}
+
+model Question {
+  id            String       @id @default(cuid())
+  quizId        String
+  quiz          Quiz         @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  type          QuestionType
+  text          String
+  audioUrl      String?      // required for QuestionType.AUDIO
+  passageText   String?      // used for reading-comprehension split view
+  options       Json?        // [{ id, text }] for MCQ; null for TEXT
+  correctAnswer String
+  difficulty    Int          @default(1)
+  orderIndex    Int
+
+  @@index([quizId, orderIndex])
+}
+
+model QuizAttempt {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quizId      String
+  quiz        Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  score       Int
+  totalPoints Int
+  startedAt   DateTime @default(now())
+  submittedAt DateTime?
+
+  @@index([userId, quizId])
+}
+
+model Enrollment {
+  id               String            @id @default(cuid())
+  userId           String
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courseId         String
+  course           Course            @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  status           EnrollmentStatus  @default(PENDING_PAYMENT)
+  paymentReference String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  payment Payment?
+
+  @@unique([userId, courseId])
+}
+
+// Fawry / Paymob / Instapay: reference number issued on checkout,
+// confirmed via webhook, which then flips Enrollment.status to ACTIVE.
+model Payment {
+  id             String          @id @default(cuid())
+  enrollmentId   String          @unique
+  enrollment     Enrollment      @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  provider       PaymentProvider
+  status         PaymentStatus   @default(INITIATED)
+  referenceCode  String          @unique
+  amount         Decimal         @db.Decimal(10, 2)
+  rawWebhookPayload Json?
+  createdAt      DateTime        @default(now())
+  paidAt         DateTime?
+}
+
+// Admin-generated offline codes ("Code Generator" in the brief).
+model SubscriptionCode {
+  id           String    @id @default(cuid())
+  code         String    @unique
+  courseId     String
+  redeemedById String?
+  redeemedBy   User?     @relation("RedeemedBy", fields: [redeemedById], references: [id])
+  redeemedAt   DateTime?
+  createdAt    DateTime  @default(now())
+}
+
+// Admin-authored banners shown instantly on the student frontend.
+model AlertBanner {
+  id        String   @id @default(cuid())
+  courseId  String?  // null = site-wide
+  course    Course?  @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  message   String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
